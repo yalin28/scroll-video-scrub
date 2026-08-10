@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ScrollVideo 示例页 · scroll-video-scrub</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #0b0b10; color: #e8e8f0; font-family: "PingFang SC", "Microsoft YaHei", sans-serif; }
+
+  .tip {
+    position: fixed; top: 14px; left: 50%; transform: translateX(-50%); z-index: 10;
+    padding: 8px 14px; border: 1px solid #333; border-radius: 999px;
+    background: rgba(10, 10, 16, .85); font-size: 13px; color: #c9c9d6;
+    white-space: nowrap;
+  }
+
+  .sv-demo-section { height: 400vh; }
+
+  .sv-demo-stage {
+    position: sticky; top: 0; height: 100vh;
+    display: flex; align-items: center; justify-content: center;
+  }
+
+  .sv-demo-stage video {
+    display: block; width: min(86vw, 980px); max-height: 80vh;
+    height: auto; background: #000; border-radius: 10px;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, .6);
+  }
+</style>
+</head>
+<body>
+
+  <div class="tip">向下滚动，视频随滚动逐帧播放；回滚即反向 seek</div>
+
+  <section class="sv-demo-section" id="display-scroll" data-scroll-video>
+    <div class="sv-demo-stage">
+      <video id="display-video"
+        data-video-basepath="assets/demo/display"
+        data-video-breakpoint-substitution-map='{"xsmall":"small"}'
+        data-video-progress-kf='{"start":"a0t","end":"a0b - 100vh","anchors":["#display-scroll"]}'
+        data-video-load-kf='{"start":"a0t - 150vh","end":"a0b + 150vh","anchors":["#display-scroll"]}'
+        muted playsinline preload="none" aria-hidden="true"></video>
+    </div>
+  </section>
+
+  <script src="scroll-video.js"></script>
+  <script>
+    const scrollVideo = new ScrollVideo('#display-scroll', {
+      debug: 'overlay',
+      onReady: ({ duration }) => console.log('[example] ready, duration =', duration),
+    });
+    window.scrollVideo = scrollVideo;
+  </script>
+</body>
+</html>
