@@ -162,7 +162,7 @@ video.currentTime = duration * progress;
 | 选项 | 默认 | 说明 |
 |---|---|---|
 | `debug` | `false` | `false` / `'console'` / `'overlay'` |
-| `seekEpsilon` | `0.001` | 两次 `currentTime` 写入的最小间隔（秒），避免无意义 seek |
+| `seekEpsilon` | `0.001` | 目标时间变化的最小间隔（秒）；视频 seek 进行中只保留最新目标 |
 | `progressEpsilon` | `0.0001` | `progress` 事件触发的最小变化量 |
 | `reducedMotion` | `'auto'` | `'auto'`（跟随系统）/ `true`（强制停首帧）/ `false`（不处理） |
 | `onReady` / `onProgress` / `onError` | `null` | 回调 |
@@ -176,7 +176,7 @@ video.currentTime = duration * progress;
 | `new ScrollVideo(target, options)` | 初始化；`target` 可以是选择器、容器元素或 video 元素 |
 | `instance.video` | 获取内部 video 元素 |
 | `instance.getProgress()` | 获取当前 0~1 进度 |
-| `instance.recalc()` | 立即重新计算一次（resize 后可手动调用） |
+| `instance.recalc()` | 立即重新计算一次；组件也会在 `resize` 后自动调度重算 |
 | `instance.setDebug('overlay' / 'console' / false)` | 运行时切换 debug 模式 |
 | `instance.destroy()` | 销毁实例：移除监听、取消 rAF、移除调试面板 |
 

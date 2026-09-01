@@ -38,7 +38,7 @@
 
         if (this._el.tagName === 'VIDEO') {
           this._video = this._el;
-          this._el = this._video.parentElement;
+          this._el = this._video.parentElement || this._video;
         } else {
           this._video = this._el.querySelector('video');
         }
@@ -54,12 +54,16 @@
         this._sourceURLs = [];
         this._sourceIndex = 0;
         this._pendingTime = null;    // 断点切换后需要恢复的时间点
+        this._seekTarget = null;     // seek 进行中时保留最新目标时间
+        this._seekInFlight = false;
+        this._reducedMotion = false;
         this._lastProgress = -1;
         this._inRange = false;
         this._lastDirection = '';
         this._rafId = null;
         this._breakpointMQs = [];
         this._overlay = null;
+        this._invalidRangeState = { load: false, progress: false };
 
         // debug 模式：false | 'console' | 'overlay'
         this._debugMode = this._opts.debug === true ? 'overlay' : (this._opts.debug || false);
@@ -73,31 +77,43 @@
         this._tick = () => {
           this._rafId = null;
           if (this._destroyed) return;
+          if (this._reducedMotion) return;
 
           // load keyframe：只有接近滚动区间才真正加载视频
-          if (!this._shouldLoad()) return;
-          this._ensureSource();
+          // 同一帧共享测量结果，避免 loadKf 和 progressKf 重复读取同一个 anchor。
+          const measureCache = new Map();
+          if (!this._shouldLoad(measureCache)) return;
 
-          const range = this._getScrollRange();
+          const range = this._getScrollRange(this._progressKf, measureCache);
+          if (!this._isValidRange(range, 'progress')) return;
+
           const raw = (window.scrollY - range.start) / (range.end - range.start);
+          if (!Number.isFinite(raw)) return;
           const progress = clamp(raw, 0, 1);
 
           // 支持 keyframe 的 progress 区间（如 [0.3, 1]）和缓动函数
           const [p0, p1] = this._progressKf.progress || [0, 1];
+          const startProgress = clamp(p0, 0, 1);
+          const endProgress = clamp(p1, 0, 1);
           const eased = this._ease(progress);
           const target = this._duration
-            ? this._duration * (p0 + (p1 - p0) * eased)
+            ? this._duration * (startProgress + (endProgress - startProgress) * eased)
             : 0;
+          if (!Number.isFinite(target)) return;
+
+          // 所有布局读取完成后再触发 source / DOM / 视频状态写入，减少读写交错。
+          this._ensureSource();
 
           // 方向判断：目标时间变大 = 向下正放；变小 = 向上回滚（双向 seek）
-          const direction = target > this._video.currentTime + this._opts.seekEpsilon
+          const currentTime = Number.isFinite(this._video.currentTime) ? this._video.currentTime : 0;
+          const seekEpsilon = this._getSeekEpsilon();
+          const direction = target > currentTime + seekEpsilon
             ? '正放 ↓'
-            : (target < this._video.currentTime - this._opts.seekEpsilon ? '回滚 ↑' : this._lastDirection);
+            : (target < currentTime - seekEpsilon ? '回滚 ↑' : this._lastDirection);
 
-          // 核心：只有目标时间确实变化了才写入 currentTime，避免无意义 seek
-          if (this._duration && Math.abs(target - this._video.currentTime) >= this._opts.seekEpsilon) {
-            this._video.currentTime = target;
-          }
+          // 核心：每帧更新最新目标；当前 seek 完成后再继续处理，避免堆积异步 seek。
+          // 即使目标回到当前帧，也必须覆盖掉旧的 pending target。
+          if (this._duration) this._requestSeek(target);
 
           this._trackRange(progress);
           this._emitProgress(progress, target, direction);
@@ -106,13 +122,19 @@
         };
         this._onLoadedMetadata = () => {
           if (this._destroyed) return;
-          this._duration = this._video.duration || 0;
-          this._ready = true;
+          const duration = this._video.duration;
+          this._duration = Number.isFinite(duration) && duration > 0 ? duration : 0;
+          this._ready = this._duration > 0;
+          const reducedMotion = this._prefersReducedMotion();
+          this._reducedMotion = reducedMotion;
 
           // 断点切换后恢复到原时间点
           if (this._pendingTime !== null) {
-            this._video.currentTime = clamp(this._pendingTime, 0, Math.max(0, this._duration - 0.001));
+            const pendingTime = this._pendingTime;
             this._pendingTime = null;
+            if (!reducedMotion && this._ready && Number.isFinite(pendingTime)) {
+              this._requestSeek(clamp(pendingTime, 0, this._duration));
+            }
           }
 
           this._debug('info', `loadedmetadata：视频总时长 ${this._duration.toFixed(3)}s`);
@@ -122,14 +144,31 @@
           }
 
           // 用户偏好减少动态效果时，停在首帧，不做滚动 scrub
-          if (this._prefersReducedMotion()) {
-            this._video.currentTime = 0;
+          if (reducedMotion) {
+            this._requestSeek(0);
             this._debug('info', '检测到 prefers-reduced-motion，停留在首帧');
+          } else {
+            // 元数据可能在用户停止滚动后才到达，主动同步一次当前滚动位置。
+            this._onScroll();
           }
+        };
+        this._onSeeked = () => {
+          if (this._destroyed) return;
+          this._seekInFlight = false;
+          this._flushSeek();
         };
         this._onVideoError = () => {
           if (this._destroyed || this._failed) return;
+          let pendingTime = this._seekTarget;
+          if (!Number.isFinite(pendingTime)) pendingTime = this._pendingTime;
+          if (!Number.isFinite(pendingTime)) pendingTime = this._video.currentTime;
+          if (!Number.isFinite(pendingTime)) pendingTime = null;
+          this._seekTarget = null;
+          this._seekInFlight = false;
+          this._ready = false;
+          this._duration = 0;
           if (this._sourceIndex < this._sourceURLs.length - 1) {
+            this._pendingTime = pendingTime;
             this._sourceIndex += 1;
             this._debug('warn', `视频源失败，切换到：${this._sourceURLs[this._sourceIndex]}`);
             this._setSource(this._sourceURLs[this._sourceIndex]);
@@ -137,6 +176,7 @@
           }
 
           this._failed = true;
+          this._pendingTime = null;
           this._debug('error', '所有视频源均加载失败');
           if (this._poster) this._showPosterFallback();
           this._emit('error', { message: '所有视频源均加载失败' });
@@ -200,19 +240,36 @@
         } catch {
           throw new Error(`[ScrollVideo] ${attrName} 不是合法 JSON`);
         }
-        if (!kf.start || !kf.end) {
-          throw new Error(`[ScrollVideo] ${attrName} 必须包含 start 和 end`);
+        if (!kf || typeof kf !== 'object' || Array.isArray(kf)) {
+          throw new Error(`[ScrollVideo] ${attrName} 必须是 JSON 对象`);
+        }
+        const isExpression = value =>
+          typeof value === 'number' || (typeof value === 'string' && value.trim() !== '');
+        if (!isExpression(kf.start) || !isExpression(kf.end)) {
+          throw new Error(`[ScrollVideo] ${attrName} 的 start 和 end 必须是非空字符串或数字`);
+        }
+        if (kf.anchors !== undefined && !Array.isArray(kf.anchors)) {
+          throw new Error(`[ScrollVideo] ${attrName}.anchors 必须是数组`);
         }
 
         // 把 anchors 选择器解析成真实 DOM 元素；缺省时使用组件容器本身
         const selectors = kf.anchors && kf.anchors.length ? kf.anchors : [this._el];
         kf._anchors = selectors.map(sel => {
-          if (typeof sel !== 'string') return sel;
+          if (typeof sel !== 'string') {
+            if (!sel || typeof sel.getBoundingClientRect !== 'function') {
+              throw new Error(`[ScrollVideo] ${attrName} 包含无效 anchor`);
+            }
+            return sel;
+          }
           const el = this._el.querySelector(sel) || document.querySelector(sel);
           if (!el) throw new Error(`[ScrollVideo] anchor 不存在: ${sel}`);
           return el;
         });
         kf.progress = kf.progress || [0, 1];
+        if (!Array.isArray(kf.progress) || kf.progress.length !== 2 ||
+          !kf.progress.every(value => typeof value === 'number' && Number.isFinite(value))) {
+          throw new Error(`[ScrollVideo] ${attrName}.progress 必须是两个有限数字`);
+        }
         return kf;
       }
 
@@ -221,11 +278,13 @@
       _bindEvents() {
         this._video.addEventListener('loadedmetadata', this._onLoadedMetadata);
         this._video.addEventListener('error', this._onVideoError);
+        this._video.addEventListener('seeked', this._onSeeked);
       }
 
       _bindScroll() {
         // scroll 只做“标记”，真正的计算放在下一帧 rAF，避免滚动事件风暴
         window.addEventListener('scroll', this._onScroll, { passive: true });
+        window.addEventListener('resize', this._onScroll, { passive: true });
       }
 
       _bindBreakpoints() {
@@ -267,8 +326,15 @@
       _reloadSource() {
         // 断点切换时保留当前播放位置，新源加载完成后恢复
         if (!this._sourceStarted || this._failed) return;
-        this._pendingTime = this._video.currentTime ||
-          (this._lastProgress >= 0 ? this._lastProgress * this._duration : 0);
+        let pendingTime = this._seekTarget;
+        if (!Number.isFinite(pendingTime)) pendingTime = this._pendingTime;
+        if (!Number.isFinite(pendingTime)) pendingTime = this._video.currentTime;
+        if (!Number.isFinite(pendingTime) && Number.isFinite(this._lastProgress) && Number.isFinite(this._duration)) {
+          pendingTime = this._lastProgress * this._duration;
+        }
+        this._pendingTime = Number.isFinite(pendingTime) ? pendingTime : 0;
+        this._seekTarget = null;
+        this._seekInFlight = false;
         this._sourceStarted = false;
         this._sourceIndex = 0;
         this._ensureSource();
@@ -298,6 +364,9 @@
 
       _setSource(url) {
         this._debug('info', `加载视频源：${url}`);
+        this._ready = false;
+        this._duration = 0;
+        this._seekInFlight = false;
         this._video.src = url;
         this._video.load();
       }
@@ -320,20 +389,34 @@
 
       /* ---------------- 滚动 -> rAF -> progress -> currentTime ---------------- */
 
-      _shouldLoad() {
+      _shouldLoad(measureCache) {
         if (!this._loadKf) return true;
-        const ctx = this._exprContext(this._loadKf);
-        const start = this._evalExpr(this._loadKf.start, ctx);
-        const end = this._evalExpr(this._loadKf.end, ctx);
-        return window.scrollY >= start && window.scrollY <= end;
+        const range = this._getScrollRange(this._loadKf, measureCache);
+        if (!this._isValidRange(range, 'load')) return false;
+        return window.scrollY >= range.start && window.scrollY <= range.end;
       }
 
-      _getScrollRange() {
-        const ctx = this._exprContext(this._progressKf);
+      _getScrollRange(kf = this._progressKf, measureCache) {
+        const ctx = this._exprContext(kf, measureCache);
         return {
-          start: this._evalExpr(this._progressKf.start, ctx),
-          end: this._evalExpr(this._progressKf.end, ctx),
+          start: this._evalExpr(kf.start, ctx),
+          end: this._evalExpr(kf.end, ctx),
         };
+      }
+
+      _isValidRange(range, name) {
+        const valid = Number.isFinite(range.start) &&
+          Number.isFinite(range.end) &&
+          range.end > range.start;
+        if (!valid) {
+          if (!this._invalidRangeState[name]) {
+            this._debug('error', `${name === 'load' ? '加载' : '进度'}滚动区间无效：start=${range.start}, end=${range.end}`);
+            this._invalidRangeState[name] = true;
+          }
+        } else {
+          this._invalidRangeState[name] = false;
+        }
+        return valid;
       }
 
       /*
@@ -343,9 +426,13 @@
        *   px / vh / vw           -> 偏移量
        * 示例："a0t - 150vh"、"a0b - 100vh"
        */
-      _exprContext(kf) {
+      _exprContext(kf, measureCache) {
         return {
-          anchors: kf._anchors.map(el => el.getBoundingClientRect()),
+          anchors: kf._anchors.map(el => {
+            if (!measureCache) return el.getBoundingClientRect();
+            if (!measureCache.has(el)) measureCache.set(el, el.getBoundingClientRect());
+            return measureCache.get(el);
+          }),
           vh: window.innerHeight / 100,
           vw: window.innerWidth / 100,
           innerHeight: window.innerHeight,
@@ -392,6 +479,36 @@
           return 1 - (1 - p) * (1 - p);
         }
         return p;
+      }
+
+      _getSeekEpsilon() {
+        return Number.isFinite(this._opts.seekEpsilon) && this._opts.seekEpsilon >= 0
+          ? this._opts.seekEpsilon
+          : ScrollVideo.DEFAULTS.seekEpsilon;
+      }
+
+      _requestSeek(time) {
+        if (!Number.isFinite(time) || !this._ready || !this._duration) return;
+        this._seekTarget = clamp(time, 0, this._duration);
+        this._flushSeek();
+      }
+
+      _flushSeek() {
+        if (this._destroyed || this._seekTarget === null || !this._ready || !this._duration) return;
+        if (this._seekInFlight || this._video.seeking) return;
+
+        const target = this._seekTarget;
+        this._seekTarget = null;
+        const currentTime = this._video.currentTime;
+        if (Number.isFinite(currentTime) && Math.abs(target - currentTime) < this._getSeekEpsilon()) return;
+
+        try {
+          this._seekInFlight = true;
+          this._video.currentTime = target;
+        } catch (error) {
+          this._seekInFlight = false;
+          this._debug('error', `设置 currentTime 失败：${error && error.message ? error.message : error}`);
+        }
       }
 
       _trackRange(progress) {
@@ -551,6 +668,8 @@
         });
         this._video.removeEventListener('loadedmetadata', this._onLoadedMetadata);
         this._video.removeEventListener('error', this._onVideoError);
+        this._video.removeEventListener('seeked', this._onSeeked);
+        window.removeEventListener('resize', this._onScroll);
         this._destroyOverlay();
       }
 
@@ -561,7 +680,7 @@
 
     ScrollVideo.DEFAULTS = {
       debug: false,          // false | 'console' | 'overlay'
-      seekEpsilon: 0.001,    // currentTime 写入的最小间隔（秒），避免无意义 seek
+      seekEpsilon: 0.001,    // 目标时间变化的最小间隔（秒），避免无意义 seek
       progressEpsilon: 0.0001, // progress 事件触发的最小变化量
       reducedMotion: 'auto', // 'auto' | true | false
       breakpoints: { xsmall: 320, small: 734, medium: 1068, large: 1440 },
