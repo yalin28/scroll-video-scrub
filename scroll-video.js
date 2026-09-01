@@ -18,8 +18,8 @@
      * 在每个 section 内用 new ScrollVideo('#id', options) 初始化；
      * 素材可放 Shopify Files，data-video-basepath 填 CDN 目录地址。
      *
-     * 零依赖、单文件、可多实例。视频保持 paused + muted + playsinline，
-     * “回滚”本质是双向 seek，不是播放器倒放。
+     * 零依赖、单文件、可多实例。组件不调用 play()；调用方应按平台要求设置
+     * muted + playsinline。“回滚”本质是双向 seek，不是播放器倒放。
      */
 
     const VERSION = '1.0.0';
@@ -30,7 +30,14 @@
 
     class ScrollVideo {
       constructor(target, options = {}) {
-        this._opts = { ...ScrollVideo.DEFAULTS, ...options };
+        this._opts = {
+          ...ScrollVideo.DEFAULTS,
+          ...options,
+          breakpoints: {
+            ...ScrollVideo.DEFAULTS.breakpoints,
+            ...(options.breakpoints || {}),
+          },
+        };
 
         // 支持传入“选择器 / 容器元素 / video 元素”三种写法
         this._el = typeof target === 'string' ? document.querySelector(target) : target;
@@ -211,7 +218,9 @@
 
         // 素材目录：组件按 {basepath}/{viewport}{_2x}.{ext} 拼 URL
         this._basePath = (v.dataset.videoBasepath || this._opts.basePath || '').replace(/\/+$/, '');
-        if (!this._basePath) throw new Error('[ScrollVideo] 缺少 data-video-basepath');
+        if (!this._basePath) {
+          throw new Error('[ScrollVideo] 缺少视频素材路径（data-video-basepath 或 options.basePath）');
+        }
 
         this._alpha = v.dataset.videoAlpha === 'true';
         this._retina = v.dataset.videoRetina === 'retina';
@@ -350,8 +359,13 @@
 
       _buildSourceList() {
         const viewport = this._substitutionMap[this._viewport] || this._viewport;
-        const suffix = this._retina && window.devicePixelRatio > 1 ? '_2x' : '';
-        return this._pickExtensions().map(ext => `${this._basePath}/${viewport}${suffix}.${ext}`);
+        const extensions = this._pickExtensions();
+        const suffixes = this._retina && window.devicePixelRatio > 1
+          ? ['_2x', '']
+          : [''];
+        return suffixes.reduce((urls, suffix) => urls.concat(
+          extensions.map(ext => `${this._basePath}/${viewport}${suffix}.${ext}`)
+        ), []);
       }
 
       _ensureSource() {

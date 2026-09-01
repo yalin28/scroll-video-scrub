@@ -134,13 +134,14 @@ function createEnvironment({
   innerWidth = 1200,
   rect = { top: 0, bottom: 1000 },
   reducedMotion = false,
+  retina = false,
 } = {}) {
   const window = new FakeEventTarget();
   Object.assign(window, {
     scrollY: 0,
     innerHeight,
     innerWidth,
-    devicePixelRatio: 1,
+    devicePixelRatio: retina ? 2 : 1,
   });
 
   let nextAnimationFrameId = 1;
@@ -167,6 +168,7 @@ function createEnvironment({
   video.dataset.videoBasepath = 'assets/demo/display';
   video.dataset.videoProgressKf = JSON.stringify(progressKf);
   if (loadKf) video.dataset.videoLoadKf = JSON.stringify(loadKf);
+  if (retina) video.dataset.videoRetina = 'retina';
 
   const mediaQueries = [];
   const document = {
@@ -328,6 +330,52 @@ test('fallback source reload preserves the current seek position', () => {
 
   env.dispatchMetadata(10);
   assert.deepEqual(env.video.assignments, [4, 4]);
+});
+
+test('retina sources fall back to the matching 1x files', () => {
+  const env = createEnvironment({ retina: true });
+
+  assert.equal(JSON.stringify(env.instance._sourceURLs), JSON.stringify([
+    'assets/demo/display/large_2x.webm',
+    'assets/demo/display/large_2x.mp4',
+    'assets/demo/display/large.webm',
+    'assets/demo/display/large.mp4',
+  ]));
+
+  env.video.dispatchEvent({ type: 'error' });
+  env.video.dispatchEvent({ type: 'error' });
+  assert.match(env.video.src, /large\.webm$/);
+
+  env.video.dispatchEvent({ type: 'error' });
+  assert.match(env.video.src, /large\.mp4$/);
+});
+
+test('partial breakpoint options keep the remaining defaults', () => {
+  const env = createEnvironment();
+  const instance = new env.window.ScrollVideo(env.container, {
+    breakpoints: { small: 800 },
+  });
+
+  assert.equal(JSON.stringify(instance._opts.breakpoints), JSON.stringify({
+    xsmall: 320,
+    small: 800,
+    medium: 1068,
+    large: 1440,
+  }));
+  instance.destroy();
+});
+
+test('basePath option supplies a missing data attribute', () => {
+  const env = createEnvironment();
+  env.instance.destroy();
+  delete env.video.dataset.videoBasepath;
+
+  const instance = new env.window.ScrollVideo(env.container, {
+    basePath: 'assets/demo/display',
+  });
+
+  assert.equal(instance._basePath, 'assets/demo/display');
+  instance.destroy();
 });
 
 test('resize schedules a recalculation without requiring a scroll event', () => {
